@@ -1,30 +1,39 @@
-"""gateway_shield — KIN-282 egress audit (phase 1, OBSERVE ONLY).
+"""gateway_shield — KIN-282 egress control (phase 2: BLOCK).
 
-Hermes calls hooks as hook(tool_name, **kwargs); the tool input is kwargs['args']
-(a dict), e.g. terminal -> {'command': ...}, secure_web_reader -> {'url': ...},
-brave_web_search -> {'query': ...}. post_tool_call also gets kwargs['result'].
+Hermes calls hooks as hook(tool_name, **kwargs); tool input is kwargs['args']
+(a dict): terminal -> {'command': ...}, secure_web_reader -> {'url': ...}, etc.
 
-Two hooks, both observe-only in phase 1:
-  - pre_tool_call  → logs tool + target (command/url/query) and flags raw terminal
-    network egress. Returns None (allow). Phase 2 will veto here.
-  - post_tool_call → logs result size and whether the gateway verdict flagged an
-    injection (audit of the judge's prod decisions).
-
-stdlib only; output to stdout with `[gateway_shield]` prefix (greppable in logs).
+pre_tool_call VETOES raw network egress from the `terminal` tool by returning
+{"action": "block", "message": ...} — forcing the agent to fetch via the
+sanitizing gateway tools (secure_web_reader / brave_web_search) instead. Local
+shell work (parsing files, jq, python over already-fetched data) is untouched.
+post_tool_call (observe-only) logs result size + whether the gateway flagged an
+injection. All output to stdout with a `[gateway_shield]` prefix (Render logs).
 """
 
 import json
 import re
 
-# Raw network from the shell (we already route web through the MCP gateway tools,
-# so these tokens inside a `terminal` command mean a bypass attempt).
-_NET_TOKEN = re.compile(
-    r"\b(curl|wget|nc|ncat|telnet|aria2c|requests\.(get|post)|urllib|httpx|yt-dlp|youtube-dl|xurl)\b",
-    re.IGNORECASE,
+# Egress INTENT in a shell command → block. Fetch CLIs, python net libs, pip
+# (package fetch), and direct fetch tools. Bare URLs alone do NOT block (a URL
+# may just be printed/parsed); a fetch verb must be present.
+_EGRESS = re.compile(
+    r"(?ix)"
+    r"\b(curl|wget|nc|ncat|telnet|aria2c|ftp|lynx|links|w3m|scp|sftp)\b"
+    r"|\b(yt-dlp|youtube-dl|xurl)\b"
+    r"|(urllib\.request|urlopen|\bhttpx\b|requests\.(get|post|put|patch|request)|aiohttp|socket\.create_connection)"
+    r"|\b(pip|pip3)\s+install\b|python[0-9.]*\s+-m\s+pip\s+install"
 )
 _URL = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
 _SECRET = re.compile(
     r"(?i)(authorization:\s*bearer\s+\S+|x-subscription-token:\s*\S+|api[_-]?key\s*[=:]\s*\S+|sk-[A-Za-z0-9_\-]{8,}|sk-or-[A-Za-z0-9_\-]{8,})"
+)
+
+_BLOCK_MSG = (
+    "BLOCKED by gateway_shield (KIN-282): direct network egress from the terminal is not allowed. "
+    "Fetch URLs with the `secure_web_reader` tool and search with `brave_web_search` — both sanitize "
+    "the content and return an injection verdict. The terminal is for LOCAL processing only "
+    "(parsing files in /tmp, jq/python over already-fetched data)."
 )
 
 
@@ -49,13 +58,16 @@ def _target(ti):
 
 def on_pre_tool_call(tool_name, **kwargs):
     try:
-        blob = _redact(_target(_tool_input(kwargs)))[:500]
-        net = bool(_URL.search(blob)) or bool(_NET_TOKEN.search(blob))
-        warn = "  <<<RAW_TERMINAL_EGRESS" if (tool_name == "terminal" and net) else ""
-        print(f"[gateway_shield][audit-pre] tool={tool_name} net={net} target={blob!r}{warn}", flush=True)
-    except Exception as e:  # never let auditing break a tool call
+        blob = _target(_tool_input(kwargs))
+        red = _redact(blob)[:500]
+        if tool_name == "terminal" and _EGRESS.search(blob):
+            print(f"[gateway_shield][BLOCK] tool=terminal raw egress denied: cmd={red!r}", flush=True)
+            return {"action": "block", "message": _BLOCK_MSG}
+        net = bool(_URL.search(blob)) or bool(_EGRESS.search(blob))
+        print(f"[gateway_shield][audit-pre] tool={tool_name} net={net} target={red!r}", flush=True)
+    except Exception as e:  # never let the guard break a tool call
         print(f"[gateway_shield][audit-pre] hook_error={e!r}", flush=True)
-    return None  # phase 1: observe only. phase 2 will block raw egress here.
+    return None  # allow
 
 
 def on_post_tool_call(tool_name, **kwargs):
@@ -72,4 +84,4 @@ def on_post_tool_call(tool_name, **kwargs):
 def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
-    print("[gateway_shield] audit hooks registered (phase 1: observe-only)", flush=True)
+    print("[gateway_shield] hooks registered (phase 2: block raw terminal egress)", flush=True)
