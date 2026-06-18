@@ -1,0 +1,7 @@
+name: gateway_shield
+version: "0.1"
+description: >
+  KIN-282 egress audit (phase 1). Logs every tool call via a post_tool_call hook
+  and flags raw network egress from the `terminal` tool (curl/wget/http...).
+  OBSERVATION ONLY — no blocking yet. Phase 2 will add a pre_tool_call veto on
+  un-sanitized egress once the audit confirms what the agent actually fetches.
