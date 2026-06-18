@@ -1,18 +1,14 @@
-"""gateway_shield — KIN-282 egress audit (phase 1).
+"""gateway_shield — KIN-282 egress audit (phase 1, OBSERVE ONLY).
 
-Phase 1 = OBSERVE ONLY. Two hooks:
-  - pre_tool_call  → logs the tool ARGS (the actual command for `terminal`) and
-    returns None (= allow). This is where phase 2 will add the egress veto.
-  - post_tool_call → logs the result size. (NOTE: post_tool_call arrives with
-    params=None for the terminal tool, so the command is only visible at pre.)
+DIAGNOSTIC build: Hermes does not pass tool args as the 2nd positional param
+(empirically params=None), so we dump the FULL hook call shape (args + kwargs,
+redacted) to discover where the `terminal` command actually lives. Once known,
+the next build will extract it cleanly and (phase 2) veto raw egress here.
 
-This tells us what the agent actually fetches via the shell BEFORE we block.
-stdlib only; all output to stdout with a `[gateway_shield]` prefix (greppable in
-Render logs). post_tool_call return values are ignored by Hermes; pre_tool_call
-can veto with {"action":"block","message":...} — NOT used yet (phase 1).
+stdlib only; output to stdout with `[gateway_shield]` prefix (Render logs).
+pre_tool_call may veto with {"action":"block","message":...} — NOT used yet.
 """
 
-import json
 import re
 
 _NET_TOKEN = re.compile(
@@ -20,7 +16,6 @@ _NET_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _URL = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
-# Best-effort redaction so audit lines never leak creds a command might carry.
 _SECRET = re.compile(
     r"(?i)(authorization:\s*bearer\s+\S+|x-subscription-token:\s*\S+|api[_-]?key\s*[=:]\s*\S+|sk-[A-Za-z0-9_\-]{8,}|sk-or-[A-Za-z0-9_\-]{8,})"
 )
@@ -30,42 +25,25 @@ def _redact(s):
     return _SECRET.sub("[REDACTED]", s)
 
 
-def _command_of(params):
-    if isinstance(params, dict):
-        for k in ("command", "cmd", "script", "input", "code", "args"):
-            v = params.get(k)
-            if isinstance(v, str):
-                return v
-        return json.dumps(params, ensure_ascii=False)
-    if params is None:
-        return ""
-    return str(params)
-
-
-def on_pre_tool_call(tool_name, params=None, *args, **kwargs):
+def _dump(stage, tool_name, args, kwargs):
     try:
-        cmd = _redact(_command_of(params))[:600]
-        urls = _URL.findall(cmd)
-        net = bool(urls) or bool(_NET_TOKEN.search(cmd))
-        print(
-            f"[gateway_shield][audit-pre] tool={tool_name} net={net} urls={urls[:5]} "
-            f"ptype={type(params).__name__} cmd={cmd!r}",
-            flush=True,
-        )
-    except Exception as e:  # never let auditing break a tool call
-        print(f"[gateway_shield][audit-pre] hook_error={e!r}", flush=True)
+        shape = _redact(repr({"args": args, "kwargs": kwargs}))[:800]
+        net = bool(_URL.search(shape)) or bool(_NET_TOKEN.search(shape))
+        print(f"[gateway_shield][{stage}] tool={tool_name} net={net} shape={shape}", flush=True)
+    except Exception as e:
+        print(f"[gateway_shield][{stage}] hook_error={e!r}", flush=True)
+
+
+def on_pre_tool_call(tool_name, *args, **kwargs):
+    _dump("audit-pre", tool_name, args, kwargs)
     return None  # phase 1: observe only (allow). phase 2 will block here.
 
 
-def on_post_tool_call(tool_name, params=None, result=None, *args, **kwargs):
-    try:
-        rlen = len(result) if isinstance(result, str) else -1
-        print(f"[gateway_shield][audit-post] tool={tool_name} result_len={rlen}", flush=True)
-    except Exception as e:
-        print(f"[gateway_shield][audit-post] hook_error={e!r}", flush=True)
+def on_post_tool_call(tool_name, *args, **kwargs):
+    _dump("audit-post", tool_name, args, kwargs)
 
 
 def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
-    print("[gateway_shield] audit hooks registered (phase 1: observe-only, pre+post)", flush=True)
+    print("[gateway_shield] audit hooks registered (phase 1: diagnostic dump)", flush=True)
